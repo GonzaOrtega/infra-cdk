@@ -9,8 +9,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # test/no-identifying-literals.test.ts scans `git log -p --all -- src/`; the
+          # default fetch-depth: 1 gives it only the tip commit, making that scan
+          # vacuous. Full history is required for it to do anything.
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.3.13' # pinned to what's verified locally; bump deliberately
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
       - run: bun run lint
       - run: bun test
+      - name: Install gitleaks
+        run: |
+          curl -sSfLO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks_8.30.1_linux_x64.tar.gz" | sha256sum -c -
+          tar xzf gitleaks_8.30.1_linux_x64.tar.gz gitleaks
+      - name: gitleaks (working tree + full git history)
+        run: ./gitleaks detect --source . --config .gitleaks.toml --redact -v
