@@ -20,6 +20,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",
+    "@types/node": "^26.1.2",
     "aws-cdk-lib": "^2.257.0",
     "cdk-nag": "^2.38.0",
     "constructs": "^10.0.0",
