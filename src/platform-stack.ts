@@ -1,29 +1,43 @@
-import { CfnOutput, RemovalPolicy, Stack, type StackProps } from 'aws-cdk-lib'
+import { CfnOutput, RemovalPolicy, Stack, type StackProps, Tags } from 'aws-cdk-lib'
 import { CfnBudget } from 'aws-cdk-lib/aws-budgets'
 import { OpenIdConnectProvider } from 'aws-cdk-lib/aws-iam'
 import { Topic } from 'aws-cdk-lib/aws-sns'
 import { EmailSubscription } from 'aws-cdk-lib/aws-sns-subscriptions'
 import type { Construct } from 'constructs'
-import type { StageConfig, StageName } from './stages'
+import type { StageConfig } from './stages'
 
 const GITHUB_OIDC_URL = 'https://token.actions.githubusercontent.com'
 const GITHUB_OIDC_HOST = 'token.actions.githubusercontent.com'
 
 export interface PlatformStackProps extends StackProps {
-  readonly stage: StageName
   readonly cfg: StageConfig
   readonly service: string
   readonly alertsEmail: string
   /**
-   * True for the FIRST project bootstrapped into an AWS account; false for every
-   * one after. The provider is account-level and CreateOpenIDConnectProvider fails
-   * if one already exists. Detect with `aws iam list-open-id-connect-providers`.
+   * True for exactly ONE stage of ONE project per AWS account — never once per
+   * project (which would still leave every stage of that one project setting it
+   * `true`) and never once per account outright. The OIDC provider is
+   * account-level and `CreateOpenIDConnectProvider` fails if one already exists,
+   * so reusing the same value across a project's dev/stg/prod deploys — not just
+   * across different projects — creates it once and then fails with
+   * EntityAlreadyExists on every other stage's deploy in that account.
+   *
+   * Pick the single stage of the single project that bootstraps this account
+   * (conventionally `dev`) and set `true` there only; every other PlatformStack
+   * instance in the account — every other stage of THIS project, and every stage
+   * of every OTHER project — must pass `false`. Detect the starting state with
+   * `aws iam list-open-id-connect-providers`.
    */
   readonly manageOidcProvider: boolean
   /**
-   * Unfiltered account-wide monthly ceiling, in USD. Set this ONLY in the same
-   * project that sets `manageOidcProvider: true` — both are account-scoped, and N
-   * projects each declaring one would create N identical account budgets.
+   * Unfiltered account-wide monthly ceiling, in USD. Define this for exactly ONE
+   * stage of ONE project per AWS account — the same single PlatformStack instance
+   * that sets `manageOidcProvider: true`, never once per project and never for
+   * more than one stage. The underlying budget is named `account-monthly`
+   * (account-scoped, not stage-scoped); defining it a second time anywhere in the
+   * account — including by reusing the same value across a project's own
+   * dev/stg/prod deploys — fails that second deploy with
+   * DuplicateRecordException.
    *
    * Required as a backstop: the per-stage budgets filter on the `Stage`
    * cost-allocation tag, which must be activated by hand in AWS Billing and takes
@@ -33,15 +47,30 @@ export interface PlatformStackProps extends StackProps {
   readonly accountBudgetUsd?: number
 }
 
+/**
+ * The account/project-wide platform primitives every stage's workload stacks
+ * depend on: an SNS alerts topic (subscribed to `alertsEmail`), a stage-scoped
+ * cost budget filtered on the `Stage` tag, and — for exactly one owning stage per
+ * account — the GitHub Actions OIDC provider plus an unfiltered account-wide
+ * budget backstop. See `manageOidcProvider` and `accountBudgetUsd` for the
+ * single-owner rule that keeps this stack safe to instantiate once per stage.
+ */
 export class PlatformStack extends Stack {
   public readonly alertsTopic: Topic
   public readonly oidcProviderArn: string
 
   constructor(scope: Construct, id: string, props: PlatformStackProps) {
-    super(scope, id, props)
+    const stage = props.cfg.stage
+    super(scope, id, { ...props, terminationProtection: stage === 'prod' })
+
+    // Guarantee this stack's own precondition: the stage budget below filters on
+    // this tag, and a consumer who skips the optional `applyGovernance` call would
+    // otherwise get a budget that silently reads $0 forever (SEC-4).
+    Tags.of(this).add('Stage', stage)
 
     this.alertsTopic = new Topic(this, 'AlertsTopic', {
-      displayName: `${props.service} alerts (${props.stage})`,
+      displayName: `${props.service} alerts (${stage})`,
+      enforceSSL: true,
     })
     this.alertsTopic.addSubscription(new EmailSubscription(props.alertsEmail))
 
@@ -60,8 +89,8 @@ export class PlatformStack extends Stack {
       this.oidcProviderArn = `arn:aws:iam::${this.account}:oidc-provider/${GITHUB_OIDC_HOST}`
     }
 
-    this.budget(`${props.service}-${props.stage}`, props.cfg.budgetUsd, props.alertsEmail, {
-      TagKeyValue: [`user:Stage$${props.stage}`],
+    this.budget(`${props.service}-${stage}`, props.cfg.budgetUsd, props.alertsEmail, {
+      TagKeyValue: [`user:Stage$${stage}`],
     })
 
     // Unfiltered backstop. Deliberately has NO costFilters: it must keep working
