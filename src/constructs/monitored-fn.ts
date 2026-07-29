@@ -9,13 +9,13 @@ import { LogGroup, RetentionDays } from 'aws-cdk-lib/aws-logs'
 import type { ISecret } from 'aws-cdk-lib/aws-secretsmanager'
 import type { ITopic } from 'aws-cdk-lib/aws-sns'
 import { Queue } from 'aws-cdk-lib/aws-sqs'
+import { NagSuppressions } from 'cdk-nag'
 import { Construct } from 'constructs'
-import type { StageConfig, StageName } from '../stages'
+import type { StageConfig } from '../stages'
 
 export interface MonitoredFnProps {
   readonly entry: string
   readonly handler?: string
-  readonly stage: StageName
   readonly cfg: StageConfig
   /** REQUIRED. An alarm with no action is silent — the bug this library exists to prevent. */
   readonly alertsTopic: ITopic
@@ -45,17 +45,31 @@ export class MonitoredFn extends Construct {
   constructor(scope: Construct, id: string, props: MonitoredFnProps) {
     super(scope, id)
 
+    const stage = props.cfg.stage
+    // Prod state (undelivered events after the destination's own retry budget) is
+    // worth preserving on stack teardown, same as the log group beside it; every
+    // other stage is disposable (SEC-8).
+    const removalPolicy = stage === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY
+
     this.dlq = new Queue(this, 'Dlq', {
       retentionPeriod: Duration.days(14),
       enforceSSL: true,
+      removalPolicy,
     })
+    NagSuppressions.addResourceSuppressions(this.dlq, [
+      {
+        id: 'AwsSolutions-SQS3',
+        reason:
+          'This queue IS the dead-letter queue for this Lambda (wired via onFailure below) — a DLQ does not need a DLQ of its own.',
+      },
+    ])
 
     // Explicit log group, NOT the deprecated `logRetention` prop: that provisions a
     // singleton custom-resource Lambda holding logs:PutRetentionPolicy on "*" (SEC-5).
     this.logGroup = new LogGroup(this, 'Logs', {
       retention: RETENTION[props.cfg.logRetentionDays],
       encryptionKey: props.logEncryptionKey,
-      removalPolicy: props.stage === 'prod' ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY,
+      removalPolicy,
     })
 
     this.fn = new NodejsFunction(this, 'Fn', {
@@ -70,7 +84,7 @@ export class MonitoredFn extends Construct {
       maxEventAge: Duration.hours(2),
       retryAttempts: 2,
       environment: {
-        STAGE: props.stage,
+        STAGE: stage,
         LOG_LEVEL: props.cfg.logLevel,
         ...props.environment,
       },
@@ -86,6 +100,19 @@ export class MonitoredFn extends Construct {
           "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);",
       },
     })
+
+    if (this.fn.role) {
+      NagSuppressions.addResourceSuppressions(this.fn.role, [
+        {
+          id: 'AwsSolutions-IAM4',
+          reason:
+            'AWSLambdaBasicExecutionRole is the minimal AWS-managed execution role required for the function to write to CloudWatch Logs.',
+          appliesTo: [
+            'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+          ],
+        },
+      ])
+    }
 
     for (const secret of props.secrets ?? []) {
       secret.grantRead(this.fn)
