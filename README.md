@@ -1,0 +1,264 @@
+# @gonza/infra-cdk
+
+A reusable AWS CDK governance layer: cost-allocation tags, cdk-nag `AwsSolutionsChecks`,
+a per-account monitoring/budget/OIDC platform stack, a per-stage GitHub Actions OIDC deploy
+role, and a Lambda construct that cannot exist without an alarm wired to a real SNS topic.
+
+This repo is **public** and contains no identifying literal in `src/` (no account id, no
+ARN with a literal account id, no email, no real GitHub owner) — a test enforces this over
+both the working tree and full git history on every change.
+
+## Install
+
+```bash
+bun add github:GonzaOrtega/infra-cdk#<40-char-commit-sha> aws-cdk-lib cdk-nag constructs
+```
+
+> **Never install by tag.** `github:GonzaOrtega/infra-cdk#v1` (or any other tag/branch ref)
+> is force-movable — whoever controls the repo can repoint the tag to different code after
+> you've reviewed and approved it, and your next `bun install` silently pulls the new
+> code straight into a job holding deploy credentials (`cdk synth` executes this library's
+> TypeScript). **Always pin the full 40-character commit SHA.** Run `bun install
+> --frozen-lockfile` in CI, and treat any lockfile diff touching this dependency as a
+> review-gated change, same as a production secret.
+
+`aws-cdk-lib`, `cdk-nag`, and `constructs` are peer dependencies — install them alongside
+this package at the versions your CDK app already uses (`^2.257.0`, `^2.38.0`, `^10.0.0`
+respectively, or newer within those major lines).
+
+## Usage
+
+`bin/app.ts` — the full wiring for a project's CDK app. This compiles against the current
+API; check `src/*.ts` before copying if the API has moved on.
+
+```ts
+import { App, Stack } from 'aws-cdk-lib'
+import {
+  applyGovernance,
+  defineStages,
+  GithubOidcStack,
+  MonitoredFn,
+  PlatformStack,
+  resolveStage,
+} from '@gonza/infra-cdk'
+
+const SERVICE = 'my-api'
+const OWNER_EMAIL = 'you@example.com'
+
+// Account-scoped, NOT stage-scoped: true only in the one project that first bootstraps
+// this AWS account (see "manageOidcProvider" below). Same value for every stage's deploy.
+const IS_FIRST_PROJECT_IN_ACCOUNT = false
+
+const app = new App()
+const stage = resolveStage(app) // reads --context stage=dev|stg|prod, throws otherwise
+const cfg = defineStages({ dev: 25, stg: 50, prod: 200 })[stage]
+const env = { account: process.env.CDK_DEFAULT_ACCOUNT!, region: 'us-east-1' }
+
+applyGovernance(app, { service: SERVICE, owner: OWNER_EMAIL, stage })
+
+const platform = new PlatformStack(app, `${SERVICE}-platform-${stage}`, {
+  env,
+  stage,
+  cfg,
+  service: SERVICE,
+  alertsEmail: OWNER_EMAIL,
+  manageOidcProvider: IS_FIRST_PROJECT_IN_ACCOUNT,
+  accountBudgetUsd: IS_FIRST_PROJECT_IN_ACCOUNT ? 300 : undefined,
+})
+
+new GithubOidcStack(app, `${SERVICE}-oidc-${stage}`, {
+  env,
+  stage,
+  service: SERVICE,
+  githubOrg: 'your-org',
+  githubRepo: SERVICE,
+  githubOwnerId: 12345678, // gh api repos/OWNER/REPO --jq '{repo: .id, owner: .owner.id}'
+  githubRepoId: 87654321,
+  bootstrapQualifier: `${stage}q`, // devq | stgq | prodq — must match this stage's `cdk bootstrap --qualifier`
+  oidcProviderArn: platform.oidcProviderArn,
+})
+
+// Project-owned workload stack.
+class ApiStack extends Stack {
+  constructor(scope: App, id: string) {
+    super(scope, id, { env })
+
+    new MonitoredFn(this, 'Health', {
+      entry: `${import.meta.dirname}/../src/handlers/health.ts`,
+      stage,
+      cfg,
+      alertsTopic: platform.alertsTopic, // REQUIRED — an alarm with no action is silent
+    })
+  }
+}
+
+new ApiStack(app, `${SERVICE}-${stage}`)
+```
+
+## Bootstrap — one command per stage, each with its own qualifier
+
+Every stage needs its own `cdk bootstrap` run with a **distinct `--qualifier`**:
+
+```bash
+bunx cdk bootstrap aws://<ACCOUNT>/<REGION> \
+  --qualifier devq \
+  --toolkit-stack-name CDKToolkit-dev \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/PowerUserAccess \
+  --custom-permissions-boundary <boundary-name>
+
+bunx cdk bootstrap aws://<ACCOUNT>/<REGION> \
+  --qualifier stgq \
+  --toolkit-stack-name CDKToolkit-stg \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/PowerUserAccess \
+  --custom-permissions-boundary <boundary-name>
+
+bunx cdk bootstrap aws://<ACCOUNT>/<REGION> \
+  --qualifier prodq \
+  --toolkit-stack-name CDKToolkit-prod \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/PowerUserAccess \
+  --custom-permissions-boundary <boundary-name>
+```
+
+**Do not reuse the default qualifier (`hnb659fds`) or share one qualifier across stages.**
+A shared qualifier means every stage bootstraps into the *same* four roles
+(`cdk-<qualifier>-deploy-role-...`, `-file-publishing-role-...`, `-image-publishing-role-...`,
+`-lookup-role-...`), the same CloudFormation execution role, and the same asset bucket.
+`GithubOidcStack`'s dev deploy role can only `sts:AssumeRole` into `devq`'s bootstrap roles
+— but if dev and prod both bootstrapped with the same qualifier, "`devq`'s deploy role" and
+"prod's deploy role" are the same role. The dev role could then update the prod stack, and
+dev's file-publishing role could overwrite an asset in the shared bucket that prod deploys
+unmodified — a supply-chain path from a lower-trust stage into production. Each
+`GithubOidcStack` instance only lists its own stage's qualifier in its inline
+`AssumeCdkBootstrap` policy; that isolation only holds if bootstrap itself used per-stage
+qualifiers.
+
+## `manageOidcProvider`
+
+The GitHub Actions OIDC provider (`token.actions.githubusercontent.com`) is **account-level**
+— there can only be one per AWS account, and `CreateOpenIDConnectProvider` fails if one
+already exists. Set `manageOidcProvider: true` **only in the first project bootstrapped
+into a given account** (it creates the provider with `RemovalPolicy.RETAIN`). Every project
+that shares that account afterward must pass `manageOidcProvider: false` (it imports the
+provider by ARN instead).
+
+Detect which case applies before writing `bin/app.ts`:
+
+```bash
+aws iam list-open-id-connect-providers
+```
+
+If the output already contains an ARN ending in `token.actions.githubusercontent.com`, the
+provider exists — use `false`. If the list is empty (or has no entry for that host), you are
+the first project in this account — use `true`.
+
+## `accountBudgetUsd`
+
+Set this **only in that same first project** (alongside `manageOidcProvider: true`) — it is
+also account-scoped, and every project that declares it creates another identical
+account-wide budget.
+
+The per-stage budget (`cfg.budgetUsd`, always set) filters on the `Stage` cost-allocation
+tag via `CostFilters: { TagKeyValue: ['user:Stage$<stage>'] }`. That tag is **not active by
+default** — activate it by hand in the AWS Console under **Billing → Cost allocation
+tags**, and it takes roughly **24 hours** to start populating cost data. Until it's active,
+every per-stage budget reads **zero** spend, not "unknown" — it looks healthy while
+tracking nothing. Even once active, a tag-filtered budget **never sees untagged
+resources at all** (a mistyped bin/app.ts that skips `applyGovernance`, a manually-created
+resource, anything predating the tag). `accountBudgetUsd` — unfiltered, total account
+spend — is therefore the only ceiling that is real from day one and stays real regardless
+of tagging correctness. Treat the per-stage budgets as attribution, and the account budget
+as the actual backstop.
+
+## GitHub numeric ids
+
+`GithubOidcStack` needs the GitHub org's and repo's **numeric** ids, not their names:
+
+```bash
+gh api repos/OWNER/REPO --jq '{repo: .id, owner: .owner.id}'
+```
+
+Feed `.repo` into `githubRepoId` and `.owner` into `githubOwnerId`.
+
+This matters because **repositories created after 2026-07-15 emit an immutable `sub`
+claim format** from GitHub's OIDC token issuer:
+
+```
+old (pre-2026-07-15 repos, name-based, mutable on rename): repo:octocat/my-repo:ref:refs/heads/main
+new (repos created 2026-07-15 or later, id-based, immutable): repo:octocat@123456/my-repo@456789:ref:refs/heads/main
+```
+
+`GithubOidcStack` always emits the new, id-based format. If you hand it the wrong ids (or a
+stack ported from older, name-based code), the trust policy's `StringLike` condition on
+`sub` never matches what GitHub actually issues, and `AssumeRoleWithWebIdentity` fails —
+silently, as a generic "not authorized to perform sts:AssumeRoleWithWebIdentity" error with
+no indication the claim format is the cause.
+
+## Cross-stack export unwind
+
+`PlatformStack` exposes `alertsTopic` (an SNS `Topic`) as a `CfnOutput` / CloudFormation
+export, so other stacks — `GithubOidcStack`, `MonitoredFn` inside a workload stack — can
+reference `platform.alertsTopic` directly. CloudFormation refuses to delete or replace a
+stack export while any other stack still imports it (`Export ... cannot be updated as it is
+in use by ...`).
+
+If you later stop referencing `platform.alertsTopic` from a workload stack — swapping to a
+per-stack topic, decommissioning the workload stack, or restructuring which stack owns
+alerting — removing the reference is **not a one-shot deploy**:
+
+1. Deploy the workload stack first, with the reference to `platform.alertsTopic` removed
+   (or the whole stack removed). This drops the `Fn::ImportValue` and releases the export.
+2. Only then deploy `PlatformStack` with the change that affects the export (removing the
+   topic, changing its logical id, deleting the stack).
+
+Deploying both in one pass, or in the reverse order, fails the `PlatformStack` deploy with
+an export-still-in-use error.
+
+## Prod environment gate
+
+`GithubOidcStack`'s deploy role trust policy scopes the prod role's `sub` condition to
+`repo:<org>@<ownerId>/<repo>@<repoId>:environment:prod`. That string only requires the
+triggering workflow run to declare `environment: prod` in its YAML — GitHub attaches that
+claim whether or not anyone has to approve the run. **`environment:prod` in the trust
+policy is not an approval control by itself.**
+
+To make it one, configure the gate on the GitHub side: repo **Settings → Environments →
+prod → Required reviewers** (and, ideally, restrict deployment branches to `main`). Without
+required reviewers configured, anyone with write access to the repository can
+`workflow_dispatch` a deploy with `stage=prod` and the IAM condition will happily let it
+through — the environment name matched, nothing else was checked.
+
+## Public API
+
+```ts
+export type StageName = 'dev' | 'stg' | 'prod'
+export interface StageConfig {
+  readonly logRetentionDays: 7 | 30 | 90
+  readonly logLevel: 'debug' | 'info' | 'warn'
+  readonly reservedConcurrency?: number
+  readonly canary: boolean
+  readonly budgetUsd: number
+}
+
+export function defineStages(
+  budgets: Record<StageName, number>,
+  overrides?: Partial<Record<StageName, Partial<Omit<StageConfig, 'budgetUsd'>>>>,
+): Record<StageName, StageConfig>
+
+export function isStageName(value: unknown): value is StageName
+export function resolveStage(app: App): StageName // throws if --context stage= is missing/invalid
+
+export interface GovernanceOptions {
+  readonly service: string
+  readonly owner: string
+  readonly stage: StageName
+}
+export function applyGovernance(app: App, opts: GovernanceOptions): void
+
+export class PlatformStack extends Stack /* SNS alertsTopic + budget(s) + OIDC provider */
+export class GithubOidcStack extends Stack /* per-stage deploy role + dev-only PR-diff role */
+export class MonitoredFn extends Construct /* NodejsFunction + LogGroup + DLQ + alarms */
+```
+
+See `src/*.ts` for the full prop interfaces (`PlatformStackProps`, `GithubOidcStackProps`,
+`MonitoredFnProps`) — every prop above that isn't self-explanatory is documented inline
+where it's declared.
