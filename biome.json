@@ -13,5 +13,5 @@
       "semicolons": "asNeeded"
     }
   },
-  "linter": { "enabled": true, "rules": { "preset": "none" } }
+  "linter": { "enabled": true, "rules": { "preset": "recommended" } }
 }
