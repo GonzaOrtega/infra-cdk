@@ -29,9 +29,24 @@ function sourceFiles(dir: string): string[] {
 }
 
 function findHits(text: string): string[] {
-  // Template literals that BUILD an ARN from this.account are fine; only hardcoded
-  // values matter, so strip ${...} interpolations before matching.
-  const stripped = text.replace(/\$\{[^}]*\}/g, 'X')
+  // Strip ONLY interpolations whose body is a bare identifier or property path
+  // (${this.account}, ${props.githubOrg}) — those are legitimate compositions.
+  // An interpolation containing a quoted literal or any other expression, e.g.
+  // ${'820815709766'}, is deliberately NOT stripped: an unconditional strip blinds
+  // the guard to any value hidden inside a slot.
+  const identifierStripped = text.replace(
+    /\$\{\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\}/g,
+    'X',
+  )
+  // Unwrap (don't blank) interpolations whose body is a single quoted string
+  // literal, e.g. ${'820815709766'} -> 820815709766. The FORBIDDEN patterns below
+  // are character-class based (`[\w.+-]+@[\w-]+`, `\d{12}`, ...), so `${`, `}` and
+  // quote characters sitting between two split fragments — e.g.
+  // `${'someone'}@${'example.com'}` — would otherwise break adjacency and hide
+  // the literal from the very patterns meant to catch it, even though it was
+  // never stripped. Unwrapping keeps the literal's characters contiguous with
+  // whatever literal text surrounds it, so it stays visible to those patterns.
+  const stripped = identifierStripped.replace(/\$\{\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1\s*\}/g, '$2')
   return FORBIDDEN.filter(({ re }) => re.test(stripped)).map(({ name }) => name)
 }
 
