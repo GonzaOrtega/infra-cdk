@@ -10,7 +10,6 @@ describe('defineStages', () => {
     expect(s.dev.logRetentionDays).toBe(7)
     expect(s.dev.logLevel).toBe('debug')
     expect(s.prod.logRetentionDays).toBe(90)
-    expect(s.prod.canary).toBe(true)
     expect(s.prod.reservedConcurrency).toBe(50)
   })
 
@@ -22,6 +21,20 @@ describe('defineStages', () => {
     const s = defineStages(BUDGETS, { dev: { logLevel: 'warn' } })
     expect(s.dev.logLevel).toBe('warn')
     expect(s.dev.logRetentionDays).toBe(7)
+  })
+
+  it('populates cfg.stage so consumers can derive the stage from cfg instead of threading it separately', () => {
+    const s = defineStages(BUDGETS)
+    expect(s.dev.stage).toBe('dev')
+    expect(s.stg.stage).toBe('stg')
+    expect(s.prod.stage).toBe('prod')
+  })
+
+  it('rejects a zero or negative budget, matching how GithubOidcStack validates its qualifier', () => {
+    expect(() => defineStages({ ...BUDGETS, dev: 0 })).toThrow(/budgetUsd/i)
+    expect(() => defineStages({ ...BUDGETS, dev: -10 })).toThrow(/budgetUsd/i)
+    expect(() => defineStages({ ...BUDGETS, dev: Number.NaN })).toThrow(/budgetUsd/i)
+    expect(() => defineStages({ ...BUDGETS, dev: Number.POSITIVE_INFINITY })).toThrow(/budgetUsd/i)
   })
 })
 

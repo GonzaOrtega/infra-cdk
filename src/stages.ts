@@ -3,22 +3,28 @@ import type { App } from 'aws-cdk-lib'
 export type StageName = 'dev' | 'stg' | 'prod'
 
 export interface StageConfig {
+  /**
+   * The stage this config belongs to. Populated by `defineStages` — always derive
+   * the stage from `cfg.stage` rather than threading a separate `stage` prop
+   * alongside `cfg`; the two can otherwise drift (e.g. `stage: 'prod'` paired with
+   * `cfg: stages.dev`), silently synthesizing the wrong retention/removal policy.
+   */
+  readonly stage: StageName
   readonly logRetentionDays: 7 | 30 | 90
   readonly logLevel: 'debug' | 'info' | 'warn'
   readonly reservedConcurrency?: number
-  readonly canary: boolean
   /** Monthly USD ceiling. No library default — a published default advertises the spend ceiling (SEC-4). */
   readonly budgetUsd: number
 }
 
 const STAGE_NAMES = ['dev', 'stg', 'prod'] as const
 
-type StageDefaults = Omit<StageConfig, 'budgetUsd'>
+type StageDefaults = Omit<StageConfig, 'stage' | 'budgetUsd'>
 
 const DEFAULTS: Record<StageName, StageDefaults> = {
-  dev: { logRetentionDays: 7, logLevel: 'debug', canary: false },
-  stg: { logRetentionDays: 30, logLevel: 'info', canary: false },
-  prod: { logRetentionDays: 90, logLevel: 'info', canary: true, reservedConcurrency: 50 },
+  dev: { logRetentionDays: 7, logLevel: 'debug' },
+  stg: { logRetentionDays: 30, logLevel: 'info' },
+  prod: { logRetentionDays: 90, logLevel: 'info', reservedConcurrency: 50 },
 }
 
 export function isStageName(value: unknown): value is StageName {
@@ -31,7 +37,13 @@ export function defineStages(
 ): Record<StageName, StageConfig> {
   const result = {} as Record<StageName, StageConfig>
   for (const stage of STAGE_NAMES) {
-    result[stage] = { ...DEFAULTS[stage], ...overrides[stage], budgetUsd: budgets[stage] }
+    const budgetUsd = budgets[stage]
+    if (!(Number.isFinite(budgetUsd) && budgetUsd > 0)) {
+      throw new Error(
+        `defineStages: budgetUsd for stage "${stage}" must be a positive finite number (got: ${String(budgetUsd)})`,
+      )
+    }
+    result[stage] = { ...DEFAULTS[stage], ...overrides[stage], stage, budgetUsd }
   }
   return result
 }
