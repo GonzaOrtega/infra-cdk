@@ -27,6 +27,12 @@ export interface GithubOidcStackProps extends StackProps {
   readonly deployBranch?: string
 }
 
+/**
+ * Per-stage GitHub Actions OIDC trust: a deploy role scoped to this stage's own
+ * CDK bootstrap qualifier (never another stage's), plus — on `dev` only — a
+ * read-only PR-diff role with explicit `Deny` on data-reading actions, since
+ * `cdk diff` executes attacker-authored TypeScript from the pull request.
+ */
 export class GithubOidcStack extends Stack {
   public readonly deployRoleArn: string
   public readonly diffRoleArn?: string

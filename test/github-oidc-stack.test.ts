@@ -39,9 +39,28 @@ describe('GithubOidcStack', () => {
     })
   })
 
-  it('pins job_workflow_ref to the exact workflow file and branch', () => {
-    const json = JSON.stringify(build('prod', 'prodq').findResources('AWS::IAM::Role'))
-    expect(json).toContain('example-org/example-repo/.github/workflows/deploy.yml@refs/heads/main')
+  it('pins job_workflow_ref under ForAnyValue:StringEquals — a plain StringEquals fails open on repeated claims', () => {
+    // ForAnyValue:StringEquals fails CLOSED when the claim is absent from the token;
+    // a plain StringEquals against a multivalued claim key behaves differently and
+    // is not the intended control. Assert the exact operator, not just substring
+    // presence of the workflow ref, so a regression to plain StringEquals is caught.
+    build('prod', 'prodq').hasResourceProperties('AWS::IAM::Role', {
+      RoleName: 'example-svc-github-deploy-prod',
+      AssumeRolePolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Condition: Match.objectLike({
+              'ForAnyValue:StringEquals': {
+                'token.actions.githubusercontent.com:job_workflow_ref': [
+                  'example-org/example-repo/.github/workflows/deploy.yml@refs/heads/main',
+                  'example-org/example-repo/.github/workflows/deploy-infra.yml@refs/heads/main',
+                ],
+              },
+            }),
+          }),
+        ]),
+      }),
+    })
   })
 
   it('scopes the deploy role to ONLY its own stage bootstrap qualifier', () => {
@@ -52,22 +71,55 @@ describe('GithubOidcStack', () => {
     expect(json).not.toContain('cdk-hnb659fds-')
   })
 
-  it('rejects an invalid bootstrap qualifier', () => {
-    expect(() => build('dev', 'this-is-way-too-long')).toThrow(/qualifier/i)
+  it('rejects a qualifier longer than 10 chars even though it is alphanumeric', () => {
+    // 12 alphanumeric chars — must fail on LENGTH, not be confused with the
+    // separate non-alphanumeric case below.
+    expect(() => build('dev', 'devqdevqdev1')).toThrow(/qualifier/i)
   })
 
-  it('gives the PR diff role explicit Deny on data-reading actions', () => {
+  it('rejects a qualifier containing non-alphanumeric characters', () => {
+    // 5 chars, within the length limit, but the underscore is not alphanumeric.
+    expect(() => build('dev', 'dev_q')).toThrow(/qualifier/i)
+  })
+
+  it('gives the PR diff role — and ONLY the diff role — explicit Deny on data-reading actions', () => {
     // cdk diff runs attacker-authored TypeScript; ReadOnlyAccess would expose
     // lambda:GetFunction (presigned URL to the source zip) and s3:GetObject (SEC-2).
     // NOTE: `inlinePolicies` on RoleProps synthesizes as an embedded `Policies` array
     // on the AWS::IAM::Role resource itself in aws-cdk-lib 2.262.1 — not as a
     // standalone AWS::IAM::Policy resource (that form only appears via
-    // `role.attachInlinePolicy()`). The brief's test queried AWS::IAM::Policy, which
-    // is always empty here; querying AWS::IAM::Role asserts the identical content.
-    const json = JSON.stringify(build('dev', 'devq').findResources('AWS::IAM::Role'))
-    expect(json).toContain('Deny')
-    expect(json).toContain('lambda:GetFunction')
-    expect(json).toContain('secretsmanager:GetSecretValue')
+    // `role.attachInlinePolicy()`).
+    const template = build('dev', 'devq')
+
+    template.hasResourceProperties('AWS::IAM::Role', {
+      RoleName: 'example-svc-github-cdk-diff',
+      Policies: Match.arrayWith([
+        Match.objectLike({
+          PolicyDocument: Match.objectLike({
+            Statement: Match.arrayWith([
+              Match.objectLike({
+                Effect: 'Deny',
+                Action: Match.arrayWith(['lambda:GetFunction', 'secretsmanager:GetSecretValue']),
+                Resource: '*',
+              }),
+            ]),
+          }),
+        }),
+      ]),
+    })
+
+    // The Deny must not have migrated onto the deploy role — its inline policy is
+    // ONLY the CDK-bootstrap AssumeRole statement, with no Deny statement at all.
+    template.hasResourceProperties('AWS::IAM::Role', {
+      RoleName: 'example-svc-github-deploy-dev',
+      Policies: [
+        Match.objectLike({
+          PolicyDocument: Match.objectLike({
+            Statement: [Match.objectLike({ Effect: 'Allow', Action: 'sts:AssumeRole' })],
+          }),
+        }),
+      ],
+    })
   })
 
   it('creates the diff role only on dev', () => {
