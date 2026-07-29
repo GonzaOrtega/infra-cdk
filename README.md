@@ -26,6 +26,13 @@ bun add github:GonzaOrtega/infra-cdk#<40-char-commit-sha> aws-cdk-lib cdk-nag co
 this package at the versions your CDK app already uses (`^2.257.0`, `^2.38.0`, `^10.0.0`
 respectively, or newer within those major lines).
 
+> **No build step.** `package.json`'s `main`/`types` point straight at `src/index.ts` — this
+> package ships raw TypeScript, not compiled JS + `.d.ts`. That's fine for `cdk synth`
+> (which already runs your app through a TS-aware runner), but it means your bundler/runner
+> must be able to resolve and compile `.ts` files from `node_modules` — `bunx cdk` and
+> `ts-node`-based setups do this out of the box; a plain `node` invocation without a loader
+> will not.
+
 ## Usage
 
 `bin/app.ts` — the full wiring for a project's CDK app. This compiles against the current
@@ -45,30 +52,30 @@ import {
 const SERVICE = 'my-api'
 const OWNER_EMAIL = 'you@example.com'
 
-// Account-scoped, NOT stage-scoped: true only in the one project that first bootstraps
-// this AWS account (see "manageOidcProvider" below). Same value for every stage's deploy.
-const IS_FIRST_PROJECT_IN_ACCOUNT = false
-
 const app = new App()
 const stage = resolveStage(app) // reads --context stage=dev|stg|prod, throws otherwise
-const cfg = defineStages({ dev: 25, stg: 50, prod: 200 })[stage]
+const cfg = defineStages({ dev: 25, stg: 50, prod: 200 })[stage] // cfg.stage === stage — see below
 const env = { account: process.env.CDK_DEFAULT_ACCOUNT!, region: 'us-east-1' }
 
 applyGovernance(app, { service: SERVICE, owner: OWNER_EMAIL, stage })
 
+// manageOidcProvider and accountBudgetUsd are both account-scoped, not stage-scoped:
+// exactly ONE stage of ONE project per AWS account may own them (conventionally `dev`
+// of the first project bootstrapped into the account). Gate on a SINGLE stage, not a
+// per-project constant reused across dev/stg/prod — see "manageOidcProvider" below for
+// why reusing one value across every stage's deploy fails the second deploy outright.
 const platform = new PlatformStack(app, `${SERVICE}-platform-${stage}`, {
   env,
-  stage,
-  cfg,
+  cfg, // stage is derived from cfg.stage — do not pass a separate `stage` prop
   service: SERVICE,
   alertsEmail: OWNER_EMAIL,
-  manageOidcProvider: IS_FIRST_PROJECT_IN_ACCOUNT,
-  accountBudgetUsd: IS_FIRST_PROJECT_IN_ACCOUNT ? 300 : undefined,
+  manageOidcProvider: stage === 'dev',
+  accountBudgetUsd: stage === 'dev' ? 300 : undefined,
 })
 
 new GithubOidcStack(app, `${SERVICE}-oidc-${stage}`, {
   env,
-  stage,
+  stage, // GithubOidcStack takes no `cfg`, so it keeps its own `stage` prop
   service: SERVICE,
   githubOrg: 'your-org',
   githubRepo: SERVICE,
@@ -85,8 +92,7 @@ class ApiStack extends Stack {
 
     new MonitoredFn(this, 'Health', {
       entry: `${import.meta.dirname}/../src/handlers/health.ts`,
-      stage,
-      cfg,
+      cfg, // stage is derived from cfg.stage — do not pass a separate `stage` prop
       alertsTopic: platform.alertsTopic, // REQUIRED — an alarm with no action is silent
     })
   }
@@ -94,6 +100,13 @@ class ApiStack extends Stack {
 
 new ApiStack(app, `${SERVICE}-${stage}`)
 ```
+
+`PlatformStack` and `MonitoredFn` both derive their stage from `cfg.stage` — set by
+`defineStages` — instead of taking a separate `stage` prop. Threading `stage` and `cfg`
+independently let them drift (`stage: 'prod'` paired with `cfg: stages.dev` used to silently
+synthesize 7-day log retention under a prod `RETAIN` removal policy); deriving stage from
+`cfg.stage` makes that impossible. `GithubOidcStack` does not take a `cfg`, so it keeps its
+own `stage` prop.
 
 ## Bootstrap — one command per stage, each with its own qualifier
 
@@ -136,10 +149,18 @@ qualifiers.
 
 The GitHub Actions OIDC provider (`token.actions.githubusercontent.com`) is **account-level**
 — there can only be one per AWS account, and `CreateOpenIDConnectProvider` fails if one
-already exists. Set `manageOidcProvider: true` **only in the first project bootstrapped
-into a given account** (it creates the provider with `RemovalPolicy.RETAIN`). Every project
-that shares that account afterward must pass `manageOidcProvider: false` (it imports the
+already exists. Set `manageOidcProvider: true` for **exactly ONE stage of ONE project per
+AWS account** (it creates the provider with `RemovalPolicy.RETAIN`). Every other
+`PlatformStack` instance in that account — every other stage of THIS project, and every
+stage of every OTHER project — must pass `manageOidcProvider: false` (it imports the
 provider by ARN instead).
+
+That "one stage" qualifier matters as much as the "one project" qualifier:
+`PlatformStack` is instantiated once per stage (`dev`, `stg`, `prod`), so reusing the same
+`true` value across a single project's own stages is just as broken as reusing it across
+different projects — `dev` deploys first and creates the provider, then `stg`'s deploy fails
+with `EntityAlreadyExists`. Gate on a single stage, e.g. `manageOidcProvider: stage ===
+'dev'`, never on a project-level constant applied to every stage's deploy.
 
 Detect which case applies before writing `bin/app.ts`:
 
@@ -148,14 +169,18 @@ aws iam list-open-id-connect-providers
 ```
 
 If the output already contains an ARN ending in `token.actions.githubusercontent.com`, the
-provider exists — use `false`. If the list is empty (or has no entry for that host), you are
-the first project in this account — use `true`.
+provider exists — use `false` for every stage. If the list is empty (or has no entry for
+that host), pick ONE stage of this project (conventionally `dev`) to own it.
 
 ## `accountBudgetUsd`
 
-Set this **only in that same first project** (alongside `manageOidcProvider: true`) — it is
-also account-scoped, and every project that declares it creates another identical
-account-wide budget.
+Define this for **exactly ONE stage of ONE project per AWS account** — the same single
+`PlatformStack` instance that sets `manageOidcProvider: true`, never once per project and
+never for more than one stage. The underlying budget is named `account-monthly`
+(account-scoped, not stage-scoped); defining it a second time anywhere in the account —
+including by reusing the same value across a project's own dev/stg/prod deploys — fails
+that second deploy with `DuplicateRecordException`. Gate it on the same single stage as
+`manageOidcProvider`, e.g. `accountBudgetUsd: stage === 'dev' ? 300 : undefined`.
 
 The per-stage budget (`cfg.budgetUsd`, always set) filters on the `Stage` cost-allocation
 tag via `CostFilters: { TagKeyValue: ['user:Stage$<stage>'] }`. That tag is **not active by
@@ -227,21 +252,29 @@ required reviewers configured, anyone with write access to the repository can
 `workflow_dispatch` a deploy with `stage=prod` and the IAM condition will happily let it
 through — the environment name matched, nothing else was checked.
 
+## Prod termination protection
+
+`PlatformStack` sets CloudFormation `terminationProtection: true` automatically whenever
+`cfg.stage === 'prod'` — a `cdk destroy` or an accidental stack deletion in the CloudFormation
+console is rejected until protection is turned off by hand. `dev` and `stg` deploys are left
+unprotected. This is derived from `cfg.stage`, so it follows automatically from passing the
+right `cfg` — there is nothing to configure.
+
 ## Public API
 
 ```ts
 export type StageName = 'dev' | 'stg' | 'prod'
 export interface StageConfig {
+  readonly stage: StageName // populated by defineStages — derive stage from cfg.stage, don't pass both
   readonly logRetentionDays: 7 | 30 | 90
   readonly logLevel: 'debug' | 'info' | 'warn'
   readonly reservedConcurrency?: number
-  readonly canary: boolean
   readonly budgetUsd: number
 }
 
 export function defineStages(
-  budgets: Record<StageName, number>,
-  overrides?: Partial<Record<StageName, Partial<Omit<StageConfig, 'budgetUsd'>>>>,
+  budgets: Record<StageName, number>, // each value must be a positive finite number
+  overrides?: Partial<Record<StageName, Partial<Omit<StageConfig, 'stage' | 'budgetUsd'>>>>,
 ): Record<StageName, StageConfig>
 
 export function isStageName(value: unknown): value is StageName
