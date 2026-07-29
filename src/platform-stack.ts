@@ -20,6 +20,17 @@ export interface PlatformStackProps extends StackProps {
    * if one already exists. Detect with `aws iam list-open-id-connect-providers`.
    */
   readonly manageOidcProvider: boolean
+  /**
+   * Unfiltered account-wide monthly ceiling, in USD. Set this ONLY in the same
+   * project that sets `manageOidcProvider: true` — both are account-scoped, and N
+   * projects each declaring one would create N identical account budgets.
+   *
+   * Required as a backstop: the per-stage budgets filter on the `Stage`
+   * cost-allocation tag, which must be activated by hand in AWS Billing and takes
+   * ~24h to populate. Until then a filtered budget reads ZERO, so without this a
+   * fresh account has no cost ceiling at all.
+   */
+  readonly accountBudgetUsd?: number
 }
 
 export class PlatformStack extends Stack {
@@ -52,6 +63,13 @@ export class PlatformStack extends Stack {
     this.budget(`${props.service}-${props.stage}`, props.cfg.budgetUsd, props.alertsEmail, {
       TagKeyValue: [`user:Stage$${props.stage}`],
     })
+
+    // Unfiltered backstop. Deliberately has NO costFilters: it must keep working
+    // while the Stage cost-allocation tag is still inactive, and it is the only
+    // budget that sees untagged resources.
+    if (props.accountBudgetUsd !== undefined) {
+      this.budget('account', props.accountBudgetUsd, props.alertsEmail)
+    }
 
     new CfnOutput(this, 'AlertsTopicArn', { value: this.alertsTopic.topicArn })
     new CfnOutput(this, 'OidcProviderArn', { value: this.oidcProviderArn })

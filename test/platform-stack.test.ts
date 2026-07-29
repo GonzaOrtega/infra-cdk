@@ -61,4 +61,26 @@ describe('PlatformStack', () => {
     )
     expect(stack.oidcProviderArn).toContain('oidc-provider/token.actions.githubusercontent.com')
   })
+
+  it('adds an UNFILTERED account-wide budget when accountBudgetUsd is given', () => {
+    const app = new App()
+    const stack = new PlatformStack(app, 'P', {
+      env,
+      stage: 'dev',
+      cfg,
+      service: 'example-svc',
+      alertsEmail: 'alerts@example.com',
+      manageOidcProvider: true,
+      accountBudgetUsd: 300,
+    })
+    const budgets = Object.values(Template.fromStack(stack).findResources('AWS::Budgets::Budget'))
+    const unfiltered = budgets.filter((b) => b.Properties.Budget.CostFilters === undefined)
+    expect(unfiltered).toHaveLength(1)
+    expect(unfiltered[0]?.Properties.Budget.BudgetLimit).toEqual({ Amount: 300, Unit: 'USD' })
+  })
+
+  it('omits the account-wide budget when accountBudgetUsd is not given', () => {
+    const budgets = Object.values(build().template.findResources('AWS::Budgets::Budget'))
+    expect(budgets.every((b) => b.Properties.Budget.CostFilters !== undefined)).toBe(true)
+  })
 })
