@@ -1,0 +1,9 @@
+title = "infra-cdk"
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-account-id"
+description = "Hardcoded AWS account id"
+regex = '''(?:^|[^0-9])[0-9]{12}(?:[^0-9]|$)'''
+path = '''src/.*\.ts'''
