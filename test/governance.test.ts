@@ -4,6 +4,7 @@ import { AttributeType, Table } from 'aws-cdk-lib/aws-dynamodb'
 import { Topic } from 'aws-cdk-lib/aws-sns'
 import { describe, expect, it } from 'vitest'
 import { MonitoredFn } from '../src/constructs/monitored-fn'
+import { GithubOidcStack } from '../src/github-oidc-stack'
 import { applyGovernance } from '../src/governance'
 import { PlatformStack } from '../src/platform-stack'
 import { defineStages } from '../src/stages'
@@ -86,6 +87,45 @@ describe('applyGovernance', () => {
     })
 
     for (const stack of [platform, workload]) {
+      expect(
+        Annotations.fromStack(stack).findError('*', Match.stringLikeRegexp('AwsSolutions-.*')),
+        stack.stackName,
+      ).toHaveLength(0)
+    }
+  })
+
+  it('produces ZERO error-level annotations composing PlatformStack + GithubOidcStack — a consumer instantiating both must synth clean', () => {
+    // GithubOidcStack was never composed in this file, which is exactly how an
+    // IAM5 finding on the dev-only DiffRole's CfnMetadataOnly policy (both its
+    // wildcard-resource ALLOW and DENY statements) reached a consumer (`corpus`)
+    // undetected. This mirrors the PlatformStack+MonitoredFn case above: real
+    // constructs, error-level findings only.
+    const env = { account: '111111111111', region: 'us-east-1' }
+    const app = new App()
+    const cfg = defineStages({ dev: 25, stg: 50, prod: 200 }).dev
+    applyGovernance(app, { service: 'example-svc', owner: 'alerts@example.com', stage: 'dev' })
+
+    const platform = new PlatformStack(app, 'Platform', {
+      env,
+      cfg,
+      service: 'example-svc',
+      alertsEmail: 'alerts@example.com',
+      manageOidcProvider: true,
+    })
+
+    const oidc = new GithubOidcStack(app, 'Oidc', {
+      env,
+      stage: 'dev',
+      service: 'example-svc',
+      githubOrg: 'example-org',
+      githubRepo: 'example-repo',
+      githubOwnerId: 1,
+      githubRepoId: 2,
+      bootstrapQualifier: 'devq',
+      oidcProviderArn: platform.oidcProviderArn,
+    })
+
+    for (const stack of [platform, oidc]) {
       expect(
         Annotations.fromStack(stack).findError('*', Match.stringLikeRegexp('AwsSolutions-.*')),
         stack.stackName,

@@ -6,6 +6,7 @@ import {
   PolicyStatement,
   Role,
 } from 'aws-cdk-lib/aws-iam'
+import { NagSuppressions } from 'cdk-nag'
 import type { Construct } from 'constructs'
 import type { StageName } from './stages'
 
@@ -95,6 +96,12 @@ export class GithubOidcStack extends Stack {
 
     // PR diff role. cdk diff executes attacker-authored TypeScript from the PR, so
     // this role must never be able to read data — only CloudFormation metadata (SEC-2).
+    // Scoped as far as a generic, reusable library can go: this account and region,
+    // but not a specific stack name/id — the library has no way to know what a given
+    // consumer will call their stacks. Shared with the NagSuppressions appliesTo
+    // entry below so the two can never drift apart.
+    const anyStackArn = `arn:aws:cloudformation:${region}:${account}:stack/*/*`
+
     const diffRole = new Role(this, 'DiffRole', {
       roleName: `${props.service}-github-cdk-diff`,
       description: 'Read-only GitHub OIDC role for cdk-diff.yml on pull requests.',
@@ -119,9 +126,16 @@ export class GithubOidcStack extends Stack {
               actions: [
                 'cloudformation:DescribeStacks',
                 'cloudformation:GetTemplate',
-                'cloudformation:ListStacks',
                 'cloudformation:DescribeStackResources',
               ],
+              resources: [anyStackArn],
+            }),
+            // cloudformation:ListStacks has NO resource-level permissions — it is not
+            // an ARN-addressable action in AWS's IAM action reference — so it cannot
+            // be scoped below "*" (see the NagSuppressions justification below).
+            new PolicyStatement({
+              effect: Effect.ALLOW,
+              actions: ['cloudformation:ListStacks'],
               resources: ['*'],
             }),
             new PolicyStatement({
@@ -145,5 +159,20 @@ export class GithubOidcStack extends Stack {
     })
     this.diffRoleArn = diffRole.roleArn
     new CfnOutput(this, 'DiffRoleArn', { value: diffRole.roleArn })
+
+    // Three wildcards remain, each for a distinct, stateable reason. AwsSolutions-IAM5
+    // flags ANY wildcard character in a resource string, not just a bare "*" — so the
+    // `anyStackArn` scoping above earns its place (it narrows the grant from every
+    // resource in every account/region down to CloudFormation stacks in THIS account
+    // and region) without ever being able to silence the rule on its own, since a
+    // reusable library cannot know a consumer's stack name(s) ahead of time.
+    NagSuppressions.addResourceSuppressions(diffRole, [
+      {
+        id: 'AwsSolutions-IAM5',
+        reason:
+          "Three wildcards, none of which narrow further: (1) cloudformation:ListStacks has no resource-level permissions in AWS's IAM action reference — it is not ARN-addressable, so '*' is the only legal resource value. (2) The ALLOW on DescribeStacks/GetTemplate/DescribeStackResources is scoped to this account and region (arn:aws:cloudformation:<region>:<account>:stack/*/*) — the stack-name and unique-id segments stay wildcarded because this is a generic, reusable library with no way to know a consumer's stack name(s) at authoring time; this is already the narrowest possible grant. (3) The DENY statement's Resource::* is the security control, not a gap: cdk diff executes attacker-authored TypeScript from the pull request (SEC-2), so the data-reading actions must be blocked on every resource, and narrowing a Deny's scope would only widen what it fails to block.",
+        appliesTo: ['Action::cloudformation:ListStacks', `Resource::${anyStackArn}`, 'Resource::*'],
+      },
+    ])
   }
 }
