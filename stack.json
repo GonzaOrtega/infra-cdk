@@ -1,0 +1,5 @@
+{
+  "$schema": "./scripts/stack-conformance/stack.schema.json",
+  "kind": "cdk-library",
+  "intent": "production"
+}

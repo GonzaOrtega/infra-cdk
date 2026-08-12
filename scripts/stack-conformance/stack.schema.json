@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "stack.json",
+  "description": "Declares what a repo is for. kind is a claim tested against detection; intent is the only fact the tool cannot derive.",
+  "type": "object",
+  "required": ["kind", "intent"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "kind": {
+      "description": "What this repo is. Detection always wins; a mismatch is a finding.",
+      "enum": ["next-app", "expo-app", "workspace", "package", "cli", "cdk-service", "lambda-service", "cdk-library", "static-site", "docs-repo", "toolkit", "other"]
+    },
+    "intent": {
+      "description": "production runs every applicable check; sandbox runs only opt-in checks; exempt runs none.",
+      "enum": ["production", "sandbox", "exempt"]
+    },
+    "reason": {
+      "description": "Required when kind is \"other\". Why this repo has no detectable shape.",
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "pin": {
+      "description": "Override a detected kind. Permanent and always reported.",
+      "type": "object",
+      "required": ["kind", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["next-app", "expo-app", "workspace", "package", "cli", "cdk-service", "lambda-service", "cdk-library", "static-site", "docs-repo", "toolkit", "other"] },
+        "reason": { "type": "string", "minLength": 1, "pattern": "\\S" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "other" } }, "required": ["kind"] },
+      "then": { "required": ["reason"] },
+      "else": { "not": { "required": ["reason"] } }
+    }
+  ]
+}
