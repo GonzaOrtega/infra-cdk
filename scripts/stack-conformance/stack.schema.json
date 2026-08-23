@@ -15,6 +15,14 @@
       "description": "production runs every applicable check; sandbox runs only opt-in checks; exempt runs none.",
       "enum": ["production", "sandbox", "exempt"]
     },
+    "capabilities": {
+      "description": "What this repo does that switches on extra obligations. Detected from evidence; declaring is a tested claim, and a mismatch in either direction is a finding.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["persistence", "auth", "http-api", "queue", "external-api", "file-upload", "notifications", "config-secrets"]
+      }
+    },
     "reason": {
       "description": "Required when kind is \"other\". Why this repo has no detectable shape.",
       "type": "string",
