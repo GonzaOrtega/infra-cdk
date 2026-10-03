@@ -11,16 +11,21 @@ both the working tree and full git history on every change.
 ## Install
 
 ```bash
-bun add github:GonzaOrtega/infra-cdk#<40-char-commit-sha> aws-cdk-lib cdk-nag constructs
+bun add --exact @gonza/infra-cdk@<version> aws-cdk-lib cdk-nag constructs
 ```
 
-> **Never install by tag.** `github:GonzaOrtega/infra-cdk#v1` (or any other tag/branch ref)
-> is force-movable — whoever controls the repo can repoint the tag to different code after
-> you've reviewed and approved it, and your next `bun install` silently pulls the new
-> code straight into a job holding deploy credentials (`cdk synth` executes this library's
-> TypeScript). **Always pin the full 40-character commit SHA.** Run `bun install
-> --frozen-lockfile` in CI, and treat any lockfile diff touching this dependency as a
-> review-gated change, same as a production secret.
+> **Pin an exact version, never a range or a dist-tag.** `^0.1.0` or `@latest` lets your next
+> `bun install` pull code you never reviewed straight into a job holding deploy credentials
+> (`cdk synth` executes this library's TypeScript). An exact npm version cannot be
+> overwritten, and once unpublished its number cannot be reused; the lockfile also records
+> the tarball's `sha512` integrity, so a changed tarball fails `bun install --frozen-lockfile`
+> instead of installing. Run that in CI, and treat any lockfile diff touching this dependency
+> as a review-gated change, same as a production secret.
+>
+> Installing from git (`github:GonzaOrtega/infra-cdk#<40-char-commit-sha>`) still works, but
+> only pinned to the full commit SHA: a tag or branch ref is force-movable. Some sandboxed
+> environments (cloud coding agents behind a GitHub proxy) cannot fetch git dependencies at
+> all, which is why the npm package exists.
 
 `aws-cdk-lib`, `cdk-nag`, and `constructs` are peer dependencies — install them alongside
 this package at the versions your CDK app already uses (`^2.257.0`, `^2.38.0`, `^10.0.0`
